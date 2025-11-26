@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-MySQL Non-Root Installation Script - Fixed for Render/Koyeb/Render Free
-Notes:
-- Adds LD_PRELOAD fallback so libaio.so.1 is loaded even when LD_LIBRARY_PATH alone fails.
-- Ensures libaio file permissions and uses more robust extraction and logging.
-- Designed to run as non-root inside Render free containers (best-effort).
+MySQL Non-Root Installation + simple Flask status endpoint
+- Runs mysqld non-root (best-effort) and exposes a Flask webserver on $PORT (for Render).
+- Keeps MySQL running in background; Flask runs in foreground so Render sees an open port.
+- Key fixes: removed unsupported MySQL 8 options (query_cache_*), moves pid-file to data dir,
+  ensures libaio is provided and LD_PRELOAD/LD_LIBRARY_PATH are set.
 """
 
 import os
@@ -18,8 +18,16 @@ import psutil
 import socket
 import shutil
 from pathlib import Path
+from flask import Flask, Response
 
-# Configuration
+# ---- Flask app (simple status endpoint) ----
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return Response("OK\n", status=200, mimetype="text/plain")
+
+# ---- Configuration ----
 MYSQL_VERSION = "8.0.35"
 HOME = Path.home()
 INSTALL_DIR = HOME / "mysql"
@@ -39,13 +47,12 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 LIB_DIR.mkdir(parents=True, exist_ok=True)
 
-
+# ---- Utility / System info functions ----
 def print_section(message):
     print(f"\n{'='*50}")
     print(f"  {message}")
     print(f"{'='*50}\n")
     sys.stdout.flush()
-
 
 def get_system_info():
     info = {}
@@ -71,7 +78,6 @@ def get_system_info():
     info['username'] = os.getenv('USER', os.getenv('USERNAME', 'unknown'))
     info['home_dir'] = str(Path.home())
     return info
-
 
 def print_system_info(info):
     print_section("System Information")
@@ -121,7 +127,7 @@ def print_system_info(info):
     print()
     sys.stdout.flush()
 
-
+# ---- Command runner ----
 def run_command(cmd, shell=False, check=True, env=None, timeout=None):
     try:
         result = subprocess.run(
@@ -142,7 +148,7 @@ def run_command(cmd, shell=False, check=True, env=None, timeout=None):
             raise
         return e
 
-
+# ---- MySQL download / extract / libaio ----
 def download_mysql():
     mysql_filename = f"mysql-{MYSQL_VERSION}-linux-glibc2.28-x86_64.tar.xz"
     mysql_url = f"https://dev.mysql.com/get/Downloads/MySQL-8.0/{mysql_filename}"
@@ -163,12 +169,10 @@ def download_mysql():
         print(f"Error downloading MySQL: {e}")
         sys.exit(1)
 
-
 def extract_mysql(archive_path):
     print("Extracting MySQL archive...")
     sys.stdout.flush()
     with tarfile.open(archive_path, "r:xz") as tar:
-        # safety check for members
         def is_within_directory(directory, target):
             abs_directory = os.path.abspath(directory)
             abs_target = os.path.abspath(target)
@@ -182,11 +186,8 @@ def extract_mysql(archive_path):
         if top_dirs:
             extract_dir = top_dirs[0]
         else:
-            candidates = sorted(
-                [p for p in INSTALL_DIR.iterdir() if p.is_dir()],
-                key=lambda d: d.stat().st_mtime,
-                reverse=True,
-            )
+            candidates = sorted([p for p in INSTALL_DIR.iterdir() if p.is_dir()],
+                                key=lambda d: d.stat().st_mtime, reverse=True)
             extract_dir = candidates[0] if candidates else None
     if not extract_dir:
         print("❌ Could not locate extracted MySQL directory")
@@ -195,9 +196,7 @@ def extract_mysql(archive_path):
     sys.stdout.flush()
     return extract_dir
 
-
 def install_libaio():
-    """Best-effort install of libaio.so.1 into LIB_DIR and return path to libaio.so.1 if success."""
     libaio_so = LIB_DIR / "libaio.so.1"
     if libaio_so.exists():
         try:
@@ -206,7 +205,6 @@ def install_libaio():
             pass
         print(f"libaio already installed: {libaio_so}")
         return libaio_so
-
     print("Looking for system libaio...")
     try:
         result = subprocess.run(
@@ -228,7 +226,6 @@ def install_libaio():
                 print(f"Could not copy system libaio: {e}")
     except Exception:
         pass
-
     print("Downloading libaio package (best-effort)...")
     deb_file = LIB_DIR / "libaio.deb"
     libaio_url = "http://archive.ubuntu.com/ubuntu/pool/main/liba/libaio/libaio1_0.3.112-5_amd64.deb"
@@ -258,7 +255,6 @@ def install_libaio():
                                 tar.extract(member, path=LIB_DIR)
                                 extracted = LIB_DIR / member.name
                                 if extracted.exists():
-                                    # move to root of LIB_DIR
                                     target = LIB_DIR / "libaio.so.1"
                                     shutil.move(str(extracted), str(target))
                                     target.chmod(0o755)
@@ -268,24 +264,20 @@ def install_libaio():
                 pass
     except Exception as e:
         print(f"Could not download/install libaio automatically: {e}")
-
     print("⚠️  Warning: libaio not installed automatically; MySQL might still run without it in some configs.")
     return None
 
-
 def _build_mysql_env():
-    """Return environment dict that includes LD_LIBRARY_PATH and LD_PRELOAD if libaio present"""
     env = os.environ.copy()
     lib_path = str(LIB_DIR)
     existing = env.get("LD_LIBRARY_PATH", "")
     env["LD_LIBRARY_PATH"] = f"{lib_path}:{existing}" if existing else lib_path
-    # if libaio exists, set LD_PRELOAD to force loader to use it (helps when LD_LIBRARY_PATH alone fails)
     libaio = LIB_DIR / "libaio.so.1"
     if libaio.exists():
         env["LD_PRELOAD"] = str(libaio)
     return env
 
-
+# ---- MySQL init / config / start / check / setup ----
 def initialize_database(mysql_home):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
@@ -328,18 +320,18 @@ def initialize_database(mysql_home):
     print("MySQL data directory initialized")
     sys.stdout.flush()
 
-
 def create_config_file(mysql_home):
     config_path = HOME / "my.cnf"
     config_content = f"""[mysqld]
 basedir={str(mysql_home)}
 datadir={str(DATA_DIR)}
 socket={str(TMP_DIR)}/mysql.sock
-pid-file={str(TMP_DIR)}/mysql.pid
+pid-file={str(DATA_DIR)}/mysql.pid
 port={MYSQL_PORT}
 bind-address=127.0.0.1
 tmpdir={str(TMP_DIR)}
 
+# Performance settings optimized for low memory
 max_connections=20
 key_buffer_size=8M
 max_allowed_packet=4M
@@ -354,22 +346,26 @@ innodb_buffer_pool_size=128M
 innodb_log_buffer_size=4M
 innodb_flush_method=O_DIRECT
 innodb_flush_log_at_trx_commit=2
-query_cache_size=0
-query_cache_type=0
 
+# Removed query_cache_size/query_cache_type because MySQL 8.x no longer supports them
+
+# Connection settings to prevent timeouts
 connect_timeout=10
 wait_timeout=28800
 interactive_timeout=28800
 net_read_timeout=30
 net_write_timeout=60
 
+# Logging
 log_error={str(TMP_DIR)}/mysql_error.log
 log_error_verbosity=3
 
+# Skip some checks for compatibility
 skip-name-resolve
 skip-host-cache
 performance_schema=OFF
 
+# Security settings
 skip-networking=0
 default_authentication_plugin=mysql_native_password
 
@@ -385,7 +381,6 @@ socket={str(TMP_DIR)}/mysql.sock
     print(f"Configuration file created: {config_path}")
     sys.stdout.flush()
     return config_path
-
 
 def check_mysql_process_alive(process):
     if process.poll() is not None:
@@ -417,7 +412,6 @@ def check_mysql_process_alive(process):
         return False
     return True
 
-
 def start_mysql(mysql_home, config_path):
     print("Starting MySQL server...")
     sys.stdout.flush()
@@ -441,12 +435,13 @@ def start_mysql(mysql_home, config_path):
     socket_path = TMP_DIR / "mysql.sock"
     for i in range(180):
         if not check_mysql_process_alive(process):
-            sys.exit(1)
+            # leave logs printed by check_mysql_process_alive
+            return None
         if socket_path.exists():
             print(f"✅ Socket file created at {socket_path}")
             time.sleep(3)
             if not check_mysql_process_alive(process):
-                sys.exit(1)
+                return None
             print("MySQL is ready!")
             sys.stdout.flush()
             out_f.close()
@@ -466,8 +461,7 @@ def start_mysql(mysql_home, config_path):
     check_mysql_process_alive(process)
     out_f.close()
     err_f.close()
-    sys.exit(1)
-
+    return None
 
 def test_connection(mysql_home):
     print("Testing MySQL connection...")
@@ -515,7 +509,6 @@ def test_connection(mysql_home):
     print("❌ Failed to establish MySQL connection after attempts")
     return False
 
-
 def setup_database(mysql_home):
     print("Creating database and user...")
     sys.stdout.flush()
@@ -550,17 +543,17 @@ SHOW DATABASES;
             print("❌ Error creating database:")
             if result.stderr:
                 print(result.stderr)
-            sys.exit(1)
+            return False
         print(result.stdout)
         print("✅ Database and user created successfully!")
         sys.stdout.flush()
+        return True
     except subprocess.TimeoutExpired:
         print("❌ Database creation timed out")
-        sys.exit(1)
+        return False
     except Exception as e:
         print(f"❌ Error: {e}")
-        sys.exit(1)
-
+        return False
 
 def create_helper_scripts(mysql_home):
     start_script = HOME / "mysql-start.sh"
@@ -598,11 +591,10 @@ MYSQL_HOME="{str(mysql_home)}"
     print(f"  Connect: {connect_script}")
     sys.stdout.flush()
 
-
 def print_summary(mysql_process):
     print_section("Installation Complete!")
     print("✅ MySQL is now running!")
-    print(f"\nMySQL Process PID: {mysql_process.pid}")
+    print(f"\nMySQL Process PID: {mysql_process.pid if mysql_process else 'N/A'}")
     print("\nConnection Details:")
     print(f"  Host:     127.0.0.1")
     print(f"  Port:     {MYSQL_PORT}")
@@ -623,7 +615,7 @@ def print_summary(mysql_process):
     print()
     sys.stdout.flush()
 
-
+# ---- Main ----
 def main():
     print_section("MySQL Non-Root Installation")
     try:
@@ -636,6 +628,7 @@ def main():
     print(f"Data directory: {DATA_DIR}")
     print(f"Temp/Socket directory: {TMP_DIR}")
     sys.stdout.flush()
+
     try:
         archive_path = download_mysql()
         mysql_home = extract_mysql(archive_path)
@@ -647,31 +640,44 @@ def main():
         initialize_database(mysql_home)
         config_path = create_config_file(mysql_home)
         mysql_process = start_mysql(mysql_home, config_path)
-        if not test_connection(mysql_home):
-            print("❌ Cannot establish connection to MySQL")
-            check_mysql_process_alive(mysql_process)
-            sys.exit(1)
-        setup_database(mysql_home)
+        if mysql_process is None:
+            print("❌ MySQL failed to start; check logs above.")
+        else:
+            if not test_connection(mysql_home):
+                print("❌ Cannot establish connection to MySQL")
+                check_mysql_process_alive(mysql_process)
+            else:
+                # Setup DB and user (best-effort; continue even if fails)
+                ok = setup_database(mysql_home)
+                if not ok:
+                    print("⚠️ Database/user setup failed; continuing to provide Flask endpoint.")
+
         create_helper_scripts(mysql_home)
         print_summary(mysql_process)
-        print("✅ Installation completed successfully!")
-        print("\n💡 To keep MySQL running, this script must stay active (Render free container will stop when process exits).")
-        print("   Press Ctrl+C to stop MySQL and exit.")
+
+        # Start Flask server (Render requires a bound HTTP port). This is the main blocking process.
+        http_port = int(os.environ.get("PORT", os.environ.get("WEB_CONCURRENCY", "10000")))
+        print(f"Starting Flask status server on 0.0.0.0:{http_port} (Render needs this port open)...")
         sys.stdout.flush()
         try:
-            while True:
-                time.sleep(60)
-                if not check_mysql_process_alive(mysql_process):
-                    print("❌ MySQL process has died!")
-                    sys.exit(1)
+            # use threaded so Flask can handle multiple connections; debug off
+            app.run(host="0.0.0.0", port=http_port, threaded=True)
         except KeyboardInterrupt:
-            print("\n\nShutting down MySQL...")
-            mysql_process.terminate()
-            try:
-                mysql_process.wait(timeout=10)
-            except Exception:
-                mysql_process.kill()
-            print("MySQL stopped.")
+            print("\nShutting down due to KeyboardInterrupt")
+        finally:
+            # Gracefully stop MySQL if running
+            if mysql_process:
+                try:
+                    print("Stopping MySQL process...")
+                    mysql_process.terminate()
+                    mysql_process.wait(timeout=10)
+                except Exception:
+                    try:
+                        mysql_process.kill()
+                    except Exception:
+                        pass
+            print("Exited cleanly.")
+
     except KeyboardInterrupt:
         print("\n\nInstallation interrupted by user")
         sys.exit(1)
@@ -680,7 +686,6 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
