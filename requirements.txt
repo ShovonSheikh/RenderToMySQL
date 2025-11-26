@@ -1,1 +1,3 @@
-psutil
+Flask
+mysql-connector-python
+Werkzeug
