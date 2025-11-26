@@ -2,6 +2,7 @@
 """
 MySQL Non-Root Installation Script
 Works on systems without root access (e.g., Koyeb, Render)
+Automatically handles missing system libraries
 """
 
 import os
@@ -13,6 +14,7 @@ import sys
 import platform
 import psutil
 import socket
+import shutil
 from pathlib import Path
 
 # Configuration
@@ -21,6 +23,7 @@ HOME = Path.home()
 INSTALL_DIR = HOME / "mysql"
 DATA_DIR = HOME / "mysql_data"
 TMP_DIR = HOME / "mysql_tmp"
+LIB_DIR = HOME / "mysql_libs"
 MYSQL_PORT = 3306
 
 # Database configuration
@@ -179,10 +182,94 @@ def extract_mysql(archive_path):
     
     print("Extracting MySQL archive...")
     with tarfile.open(archive_path, 'r:xz') as tar:
-        tar.extractall(path=INSTALL_DIR)
+        # Use filter parameter to avoid deprecation warning
+        if sys.version_info >= (3, 12):
+            tar.extractall(path=INSTALL_DIR, filter='data')
+        else:
+            tar.extractall(path=INSTALL_DIR)
     
     print(f"Extracted to {extract_dir}")
     return extract_dir
+
+def install_libaio():
+    """Download and install libaio library to user space"""
+    LIB_DIR.mkdir(parents=True, exist_ok=True)
+    
+    libaio_so = LIB_DIR / "libaio.so.1"
+    
+    if libaio_so.exists():
+        print(f"libaio already installed: {libaio_so}")
+        return LIB_DIR
+    
+    print("Installing libaio library to user space...")
+    
+    # Try to find libaio in system first
+    try:
+        result = subprocess.run(
+            ["find", "/usr", "-name", "libaio.so.1", "2>/dev/null"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.stdout.strip():
+            system_lib = result.stdout.strip().split('\n')[0]
+            print(f"Found system libaio at: {system_lib}")
+            shutil.copy2(system_lib, libaio_so)
+            print(f"Copied to: {libaio_so}")
+            return LIB_DIR
+    except:
+        pass
+    
+    # Download libaio from Ubuntu package
+    print("Downloading libaio from package repository...")
+    
+    # URL for libaio package (Ubuntu 20.04 compatible)
+    libaio_url = "http://archive.ubuntu.com/ubuntu/pool/main/liba/libaio/libaio1_0.3.112-5_amd64.deb"
+    deb_file = LIB_DIR / "libaio.deb"
+    
+    try:
+        urllib.request.urlretrieve(libaio_url, deb_file)
+        print("Downloaded libaio package")
+        
+        # Extract .deb file
+        print("Extracting library...")
+        subprocess.run(["ar", "x", str(deb_file)], cwd=LIB_DIR, check=True)
+        
+        # Extract data.tar.xz
+        data_tar = LIB_DIR / "data.tar.xz"
+        if data_tar.exists():
+            with tarfile.open(data_tar) as tar:
+                for member in tar.getmembers():
+                    if 'libaio.so.1' in member.name:
+                        tar.extract(member, path=LIB_DIR)
+                        # Move to lib directory
+                        extracted = LIB_DIR / member.name
+                        if extracted.exists():
+                            shutil.move(str(extracted), str(libaio_so))
+                            print(f"Installed libaio to: {libaio_so}")
+                            break
+        
+        # Cleanup
+        for f in LIB_DIR.glob("*.deb"):
+            f.unlink()
+        for f in LIB_DIR.glob("*.tar.*"):
+            f.unlink()
+        for f in LIB_DIR.glob("control*"):
+            f.unlink()
+        for d in LIB_DIR.glob("lib"):
+            shutil.rmtree(d, ignore_errors=True)
+        for d in LIB_DIR.glob("usr"):
+            shutil.rmtree(d, ignore_errors=True)
+            
+        if libaio_so.exists():
+            return LIB_DIR
+        else:
+            print("⚠️  Warning: Could not install libaio automatically")
+            return None
+            
+    except Exception as e:
+        print(f"Error installing libaio: {e}")
+        return None
 
 def initialize_database(mysql_home):
     """Initialize MySQL data directory"""
@@ -197,6 +284,11 @@ def initialize_database(mysql_home):
     print("Initializing MySQL data directory...")
     mysqld = mysql_home / "bin" / "mysqld"
     
+    # Set LD_LIBRARY_PATH to include our lib directory
+    env = os.environ.copy()
+    if LIB_DIR.exists():
+        env['LD_LIBRARY_PATH'] = f"{LIB_DIR}:{env.get('LD_LIBRARY_PATH', '')}"
+    
     cmd = [
         str(mysqld),
         "--initialize-insecure",
@@ -205,7 +297,19 @@ def initialize_database(mysql_home):
         f"--user={os.getenv('USER', 'user')}"
     ]
     
-    run_command(cmd)
+    result = subprocess.run(
+        cmd,
+        env=env,
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode != 0:
+        print(f"Error initializing database:")
+        print(f"stdout: {result.stdout}")
+        print(f"stderr: {result.stderr}")
+        sys.exit(1)
+    
     print("MySQL data directory initialized")
 
 def create_config_file(mysql_home):
@@ -221,12 +325,22 @@ port={MYSQL_PORT}
 bind-address=0.0.0.0
 tmpdir={TMP_DIR}
 
-# Performance settings
-max_connections=50
-key_buffer_size=16M
-max_allowed_packet=16M
-thread_stack=192K
-thread_cache_size=8
+# Performance settings optimized for low memory (512MB)
+max_connections=20
+key_buffer_size=8M
+max_allowed_packet=4M
+thread_stack=128K
+thread_cache_size=4
+table_open_cache=64
+sort_buffer_size=256K
+read_buffer_size=256K
+read_rnd_buffer_size=256K
+join_buffer_size=256K
+innodb_buffer_pool_size=128M
+innodb_log_buffer_size=4M
+innodb_flush_method=O_DIRECT
+query_cache_size=0
+query_cache_type=0
 
 # Logging
 log_error={TMP_DIR}/mysql_error.log
@@ -234,6 +348,7 @@ log_error={TMP_DIR}/mysql_error.log
 # Skip some checks for compatibility
 skip-name-resolve
 skip-host-cache
+performance_schema=OFF
 
 [client]
 socket={TMP_DIR}/mysql.sock
@@ -256,9 +371,15 @@ def start_mysql(mysql_home, config_path):
     mysqld = mysql_home / "bin" / "mysqld"
     cmd = [str(mysqld), f"--defaults-file={config_path}"]
     
+    # Set LD_LIBRARY_PATH to include our lib directory
+    env = os.environ.copy()
+    if LIB_DIR.exists():
+        env['LD_LIBRARY_PATH'] = f"{LIB_DIR}:{env.get('LD_LIBRARY_PATH', '')}"
+    
     # Start MySQL in background
     process = subprocess.Popen(
         cmd,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE
     )
@@ -269,14 +390,28 @@ def start_mysql(mysql_home, config_path):
     print("Waiting for MySQL to start...")
     socket_path = TMP_DIR / "mysql.sock"
     
-    for i in range(30):
+    for i in range(60):  # Increased timeout for low memory systems
         if socket_path.exists():
             print("MySQL is ready!")
             time.sleep(2)  # Give it a bit more time
             return process
+        
+        # Check if process died
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            print(f"ERROR: MySQL process died!")
+            print(f"stdout: {stdout.decode()}")
+            print(f"stderr: {stderr.decode()}")
+            print(f"\nCheck error log: {TMP_DIR}/mysql_error.log")
+            if (TMP_DIR / "mysql_error.log").exists():
+                with open(TMP_DIR / "mysql_error.log") as f:
+                    print("\nError log contents:")
+                    print(f.read()[-2000:])  # Last 2000 chars
+            sys.exit(1)
+        
         time.sleep(1)
     
-    print("ERROR: MySQL failed to start within 30 seconds")
+    print("ERROR: MySQL failed to start within 60 seconds")
     print(f"Check error log: {TMP_DIR}/mysql_error.log")
     sys.exit(1)
 
@@ -314,6 +449,7 @@ def create_helper_scripts(mysql_home):
     start_script = HOME / "mysql-start.sh"
     with open(start_script, 'w') as f:
         f.write(f"""#!/bin/bash
+export LD_LIBRARY_PATH="{LIB_DIR}:$LD_LIBRARY_PATH"
 MYSQL_HOME="{mysql_home}"
 "$MYSQL_HOME/bin/mysqld" --defaults-file="$HOME/my.cnf" &
 echo "MySQL started. PID: $!"
@@ -324,6 +460,7 @@ echo "MySQL started. PID: $!"
     stop_script = HOME / "mysql-stop.sh"
     with open(stop_script, 'w') as f:
         f.write(f"""#!/bin/bash
+export LD_LIBRARY_PATH="{LIB_DIR}:$LD_LIBRARY_PATH"
 MYSQL_HOME="{mysql_home}"
 "$MYSQL_HOME/bin/mysqladmin" --socket="{TMP_DIR}/mysql.sock" -u root shutdown
 echo "MySQL stopped."
@@ -334,6 +471,7 @@ echo "MySQL stopped."
     connect_script = HOME / "mysql-connect.sh"
     with open(connect_script, 'w') as f:
         f.write(f"""#!/bin/bash
+export LD_LIBRARY_PATH="{LIB_DIR}:$LD_LIBRARY_PATH"
 MYSQL_HOME="{mysql_home}"
 "$MYSQL_HOME/bin/mysql" --socket="{TMP_DIR}/mysql.sock" -u root
 """)
@@ -384,6 +522,13 @@ def main():
         # Download and extract MySQL
         archive_path = download_mysql()
         mysql_home = extract_mysql(archive_path)
+        
+        # Install required libraries
+        print_section("Installing Dependencies")
+        lib_dir = install_libaio()
+        if not lib_dir:
+            print("⚠️  Warning: libaio not installed, MySQL may not start")
+            print("   If MySQL fails, you'll need root access to install libaio")
         
         # Initialize and configure
         initialize_database(mysql_home)
