@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Sample Application that uses MySQL
+Sample Application that uses MySQL via Unix Socket
 File: your_app.py
 This is a Flask web application that connects to MySQL
 """
@@ -12,9 +12,18 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# Database configuration - reads from environment or .mysql_credentials file
+# Database configuration - reads from mysql_config.py or environment
 def get_db_config():
     """Get database configuration"""
+    
+    # Try to import from mysql_config.py first
+    try:
+        from mysql_config import MYSQL_CONFIG
+        return MYSQL_CONFIG
+    except ImportError:
+        pass
+    
+    # Fall back to environment variables or .mysql_credentials
     config = {
         'host': os.getenv('DB_HOST', 'localhost'),
         'port': int(os.getenv('DB_PORT', 3306)),
@@ -23,17 +32,31 @@ def get_db_config():
         'password': os.getenv('DB_PASSWORD', '')
     }
     
+    # Check for socket file
+    socket_file = os.getenv('MYSQL_SOCKET')
+    if socket_file and os.path.exists(socket_file):
+        config['unix_socket'] = socket_file
+        # Remove host/port when using socket
+        config.pop('host', None)
+        config.pop('port', None)
+    
     # Try to read from credentials file if password not set
     if not config['password']:
         try:
             with open('.mysql_credentials', 'r') as f:
                 for line in f:
-                    if line.startswith('DB_PASSWORD='):
-                        config['password'] = line.split('=')[1].strip()
-                    elif line.startswith('DB_USER='):
-                        config['user'] = line.split('=')[1].strip()
-                    elif line.startswith('DB_NAME='):
-                        config['database'] = line.split('=')[1].strip()
+                    if line.startswith('export DB_PASSWORD='):
+                        config['password'] = line.split('=')[1].strip().strip('"')
+                    elif line.startswith('export DB_USER='):
+                        config['user'] = line.split('=')[1].strip().strip('"')
+                    elif line.startswith('export DB_NAME='):
+                        config['database'] = line.split('=')[1].strip().strip('"')
+                    elif line.startswith('export MYSQL_SOCKET='):
+                        socket = line.split('=')[1].strip().strip('"')
+                        if os.path.exists(socket):
+                            config['unix_socket'] = socket
+                            config.pop('host', None)
+                            config.pop('port', None)
         except FileNotFoundError:
             pass
     
@@ -47,6 +70,7 @@ def get_db_connection():
         return conn
     except mysql.connector.Error as err:
         print(f"Database connection error: {err}")
+        print(f"Config: {config}")
         return None
 
 def init_database():
@@ -145,7 +169,7 @@ def db_info():
         
         # Get table list
         cursor.execute("SHOW TABLES")
-        tables = [table[f"Tables_in_{current_db['current_db']}"] for table in cursor.fetchall()]
+        tables = [list(table.values())[0] for table in cursor.fetchall()]
         
         # Get user count
         cursor.execute("SELECT COUNT(*) as count FROM users")
@@ -155,13 +179,18 @@ def db_info():
         cursor.execute("SELECT COUNT(*) as count FROM posts")
         post_count = cursor.fetchone()
         
+        # Get connection info
+        config = get_db_config()
+        connection_type = "Unix Socket" if 'unix_socket' in config else "TCP/IP"
+        
         return jsonify({
             'mysql_version': version['version'],
             'database': current_db['current_db'],
             'tables': tables,
             'user_count': user_count['count'],
             'post_count': post_count['count'],
-            'connection': 'active'
+            'connection': 'active',
+            'connection_type': connection_type
         })
     except mysql.connector.Error as err:
         return jsonify({'error': str(err)}), 500
@@ -293,20 +322,28 @@ if __name__ == '__main__':
     print("STARTING APPLICATION")
     print("=" * 60)
     
+    # Wait a bit for MySQL to be fully ready
+    import time
+    time.sleep(5)
+    
     # Initialize database tables
     print("\nInitializing database...")
     if init_database():
         print("✓ Database ready\n")
     else:
         print("✗ Database initialization failed\n")
+        print("MySQL might still be starting up...")
     
     # Get configuration
     config = get_db_config()
-    print(f"Database: {config['database']}")
-    print(f"User: {config['user']}")
-    print(f"Host: {config['host']}:{config['port']}")
+    print(f"Database: {config.get('database', 'N/A')}")
+    print(f"User: {config.get('user', 'N/A')}")
+    if 'unix_socket' in config:
+        print(f"Connection: Unix Socket ({config['unix_socket']})")
+    else:
+        print(f"Connection: TCP/IP ({config.get('host', 'N/A')}:{config.get('port', 'N/A')})")
     print("=" * 60 + "\n")
     
     # Start Flask app
-    port = int(os.getenv('PORT', 5000))
+    port = int(os.getenv('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
