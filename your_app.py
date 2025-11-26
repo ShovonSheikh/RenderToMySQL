@@ -1,349 +1,416 @@
 #!/usr/bin/env python3
 """
-Sample Application that uses MySQL via Unix Socket
-File: your_app.py
-This is a Flask web application that connects to MySQL
+MySQL Non-Root Installation Script
+Works on systems without root access (e.g., Koyeb, Render)
 """
 
-from flask import Flask, jsonify, request
-import mysql.connector
 import os
-from datetime import datetime
+import subprocess
+import time
+import urllib.request
+import tarfile
+import sys
+import platform
+import psutil
+import socket
+from pathlib import Path
 
-app = Flask(__name__)
+# Configuration
+MYSQL_VERSION = "8.0.35"
+HOME = Path.home()
+INSTALL_DIR = HOME / "mysql"
+DATA_DIR = HOME / "mysql_data"
+TMP_DIR = HOME / "mysql_tmp"
+MYSQL_PORT = 3306
 
-# Database configuration - reads from mysql_config.py or environment
-def get_db_config():
-    """Get database configuration"""
-    
-    # Try to import from mysql_config.py first
-    try:
-        from mysql_config import MYSQL_CONFIG
-        return MYSQL_CONFIG
-    except ImportError:
-        pass
-    
-    # Fall back to environment variables or .mysql_credentials
-    config = {
-        'host': os.getenv('DB_HOST', 'localhost'),
-        'port': int(os.getenv('DB_PORT', 3306)),
-        'database': os.getenv('DB_NAME', 'myapp_db'),
-        'user': os.getenv('DB_USER', 'appuser'),
-        'password': os.getenv('DB_PASSWORD', '')
-    }
-    
-    # Check for socket file
-    socket_file = os.getenv('MYSQL_SOCKET')
-    if socket_file and os.path.exists(socket_file):
-        config['unix_socket'] = socket_file
-        # Remove host/port when using socket
-        config.pop('host', None)
-        config.pop('port', None)
-    
-    # Try to read from credentials file if password not set
-    if not config['password']:
-        try:
-            with open('.mysql_credentials', 'r') as f:
-                for line in f:
-                    if line.startswith('export DB_PASSWORD='):
-                        config['password'] = line.split('=')[1].strip().strip('"')
-                    elif line.startswith('export DB_USER='):
-                        config['user'] = line.split('=')[1].strip().strip('"')
-                    elif line.startswith('export DB_NAME='):
-                        config['database'] = line.split('=')[1].strip().strip('"')
-                    elif line.startswith('export MYSQL_SOCKET='):
-                        socket = line.split('=')[1].strip().strip('"')
-                        if os.path.exists(socket):
-                            config['unix_socket'] = socket
-                            config.pop('host', None)
-                            config.pop('port', None)
-        except FileNotFoundError:
-            pass
-    
-    return config
+# Database configuration
+DB_NAME = "myapp_db"
+DB_USER = "appuser"
+DB_PASSWORD = "SecurePass123!"  # CHANGE THIS!
 
-def get_db_connection():
-    """Create database connection"""
-    config = get_db_config()
-    try:
-        conn = mysql.connector.connect(**config)
-        return conn
-    except mysql.connector.Error as err:
-        print(f"Database connection error: {err}")
-        print(f"Config: {config}")
-        return None
+def print_section(message):
+    """Print a formatted section header"""
+    print(f"\n{'='*50}")
+    print(f"  {message}")
+    print(f"{'='*50}\n")
 
-def init_database():
-    """Initialize database with sample table"""
-    conn = get_db_connection()
-    if not conn:
-        return False
+def get_system_info():
+    """Gather and display system information"""
+    info = {}
     
-    try:
-        cursor = conn.cursor()
-        
-        # Create a sample table
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                name VARCHAR(100) NOT NULL,
-                email VARCHAR(100) UNIQUE NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # Create another sample table for posts
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS posts (
-                id INT AUTO_INCREMENT PRIMARY KEY,
-                user_id INT,
-                title VARCHAR(200) NOT NULL,
-                content TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        """)
-        
-        conn.commit()
-        print("✓ Database tables initialized successfully")
-        return True
-    except mysql.connector.Error as err:
-        print(f"Error initializing database: {err}")
-        return False
-    finally:
-        cursor.close()
-        conn.close()
+    # Basic system info
+    info['os'] = platform.system()
+    info['os_release'] = platform.release()
+    info['os_version'] = platform.version()
+    info['machine'] = platform.machine()
+    info['processor'] = platform.processor()
+    info['hostname'] = socket.gethostname()
+    info['python_version'] = platform.python_version()
+    
+    # CPU info
+    info['cpu_count_physical'] = psutil.cpu_count(logical=False)
+    info['cpu_count_logical'] = psutil.cpu_count(logical=True)
+    info['cpu_freq'] = psutil.cpu_freq()
+    
+    # Memory info
+    mem = psutil.virtual_memory()
+    info['memory_total'] = mem.total
+    info['memory_available'] = mem.available
+    info['memory_percent'] = mem.percent
+    
+    # Disk info
+    disk = psutil.disk_usage('/')
+    info['disk_total'] = disk.total
+    info['disk_used'] = disk.used
+    info['disk_free'] = disk.free
+    info['disk_percent'] = disk.percent
+    
+    # User info
+    info['username'] = os.getenv('USER', 'unknown')
+    info['home_dir'] = str(Path.home())
+    
+    return info
 
-@app.route('/')
-def home():
-    """Home page"""
-    return jsonify({
-        'message': 'MySQL on Render - Application Running!',
-        'status': 'success',
-        'timestamp': datetime.now().isoformat(),
-        'endpoints': {
-            '/': 'Home page',
-            '/health': 'Health check',
-            '/users': 'List all users (GET) or create user (POST)',
-            '/users/<id>': 'Get specific user',
-            '/posts': 'List all posts (GET) or create post (POST)',
-            '/db-info': 'Database information'
-        }
-    })
-
-@app.route('/health')
-def health():
-    """Health check endpoint"""
-    conn = get_db_connection()
-    if conn:
-        conn.close()
-        return jsonify({
-            'status': 'healthy',
-            'database': 'connected',
-            'timestamp': datetime.now().isoformat()
-        })
+def print_system_info(info):
+    """Display system information in a formatted way"""
+    print_section("System Information")
+    
+    print("📊 Operating System:")
+    print(f"   OS:            {info['os']} {info['os_release']}")
+    print(f"   Version:       {info['os_version']}")
+    print(f"   Architecture:  {info['machine']}")
+    print(f"   Processor:     {info['processor'] or 'N/A'}")
+    print(f"   Hostname:      {info['hostname']}")
+    print(f"   Python:        {info['python_version']}")
+    
+    print("\n💻 CPU:")
+    print(f"   Physical Cores: {info['cpu_count_physical']}")
+    print(f"   Logical Cores:  {info['cpu_count_logical']}")
+    if info['cpu_freq']:
+        print(f"   Frequency:      {info['cpu_freq'].current:.2f} MHz")
+        print(f"   Max Frequency:  {info['cpu_freq'].max:.2f} MHz")
+    
+    print("\n🧠 Memory:")
+    print(f"   Total:      {info['memory_total'] / (1024**3):.2f} GB")
+    print(f"   Available:  {info['memory_available'] / (1024**3):.2f} GB")
+    print(f"   Used:       {info['memory_percent']:.1f}%")
+    
+    print("\n💾 Disk (Root):")
+    print(f"   Total:      {info['disk_total'] / (1024**3):.2f} GB")
+    print(f"   Used:       {info['disk_used'] / (1024**3):.2f} GB ({info['disk_percent']:.1f}%)")
+    print(f"   Free:       {info['disk_free'] / (1024**3):.2f} GB")
+    
+    print("\n👤 User:")
+    print(f"   Username:   {info['username']}")
+    print(f"   Home Dir:   {info['home_dir']}")
+    print()
+    
+    # Check if system meets minimum requirements
+    print("⚙️  MySQL Requirements Check:")
+    
+    min_memory_gb = 1
+    min_disk_gb = 2
+    
+    memory_ok = info['memory_available'] / (1024**3) >= min_memory_gb
+    disk_ok = info['disk_free'] / (1024**3) >= min_disk_gb
+    
+    print(f"   Memory (>= {min_memory_gb}GB):  {'✅' if memory_ok else '❌'}")
+    print(f"   Disk (>= {min_disk_gb}GB):    {'✅' if disk_ok else '❌'}")
+    
+    if not memory_ok or not disk_ok:
+        print("\n⚠️  WARNING: System may not meet minimum requirements for MySQL!")
+        if not memory_ok:
+            print(f"   - Need at least {min_memory_gb}GB available memory")
+        if not disk_ok:
+            print(f"   - Need at least {min_disk_gb}GB free disk space")
     else:
-        return jsonify({
-            'status': 'unhealthy',
-            'database': 'disconnected',
-            'timestamp': datetime.now().isoformat()
-        }), 500
+        print("\n✅ System meets minimum requirements for MySQL")
+    print()
 
-@app.route('/db-info')
-def db_info():
-    """Get database information"""
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+def run_command(cmd, shell=False, check=True):
+    """Run a shell command and return the result"""
+    try:
+        result = subprocess.run(
+            cmd,
+            shell=shell,
+            check=check,
+            capture_output=True,
+            text=True
+        )
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"Error running command: {e}")
+        print(f"stderr: {e.stderr}")
+        if check:
+            sys.exit(1)
+        return e
+
+def download_mysql():
+    """Download MySQL binary if not already present"""
+    mysql_filename = f"mysql-{MYSQL_VERSION}-linux-glibc2.28-x86_64.tar.xz"
+    mysql_url = f"https://dev.mysql.com/get/Downloads/MySQL-8.0/{mysql_filename}"
+    mysql_path = INSTALL_DIR / mysql_filename
+    
+    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    
+    if mysql_path.exists():
+        print(f"MySQL archive already exists: {mysql_path}")
+        return mysql_path
+    
+    print(f"Downloading MySQL {MYSQL_VERSION}...")
+    print(f"URL: {mysql_url}")
+    print("This may take a few minutes...")
     
     try:
-        cursor = conn.cursor(dictionary=True)
-        
-        # Get MySQL version
-        cursor.execute("SELECT VERSION() as version")
-        version = cursor.fetchone()
-        
-        # Get current database
-        cursor.execute("SELECT DATABASE() as current_db")
-        current_db = cursor.fetchone()
-        
-        # Get table list
-        cursor.execute("SHOW TABLES")
-        tables = [list(table.values())[0] for table in cursor.fetchall()]
-        
-        # Get user count
-        cursor.execute("SELECT COUNT(*) as count FROM users")
-        user_count = cursor.fetchone()
-        
-        # Get post count
-        cursor.execute("SELECT COUNT(*) as count FROM posts")
-        post_count = cursor.fetchone()
-        
-        # Get connection info
-        config = get_db_config()
-        connection_type = "Unix Socket" if 'unix_socket' in config else "TCP/IP"
-        
-        return jsonify({
-            'mysql_version': version['version'],
-            'database': current_db['current_db'],
-            'tables': tables,
-            'user_count': user_count['count'],
-            'post_count': post_count['count'],
-            'connection': 'active',
-            'connection_type': connection_type
-        })
-    except mysql.connector.Error as err:
-        return jsonify({'error': str(err)}), 500
-    finally:
-        cursor.close()
-        conn.close()
+        urllib.request.urlretrieve(mysql_url, mysql_path)
+        print(f"Downloaded successfully to {mysql_path}")
+        return mysql_path
+    except Exception as e:
+        print(f"Error downloading MySQL: {e}")
+        sys.exit(1)
 
-@app.route('/users', methods=['GET', 'POST'])
-def users():
-    """Handle users - GET to list, POST to create"""
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
+def extract_mysql(archive_path):
+    """Extract MySQL archive"""
+    extract_dir = INSTALL_DIR / f"mysql-{MYSQL_VERSION}-linux-glibc2.28-x86_64"
+    
+    if extract_dir.exists():
+        print(f"MySQL already extracted: {extract_dir}")
+        return extract_dir
+    
+    print("Extracting MySQL archive...")
+    with tarfile.open(archive_path, 'r:xz') as tar:
+        tar.extractall(path=INSTALL_DIR)
+    
+    print(f"Extracted to {extract_dir}")
+    return extract_dir
+
+def initialize_database(mysql_home):
+    """Initialize MySQL data directory"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    
+    mysql_data_check = DATA_DIR / "mysql"
+    if mysql_data_check.exists():
+        print("MySQL data directory already initialized")
+        return
+    
+    print("Initializing MySQL data directory...")
+    mysqld = mysql_home / "bin" / "mysqld"
+    
+    cmd = [
+        str(mysqld),
+        "--initialize-insecure",
+        f"--basedir={mysql_home}",
+        f"--datadir={DATA_DIR}",
+        f"--user={os.getenv('USER', 'user')}"
+    ]
+    
+    run_command(cmd)
+    print("MySQL data directory initialized")
+
+def create_config_file(mysql_home):
+    """Create MySQL configuration file"""
+    config_path = HOME / "my.cnf"
+    
+    config_content = f"""[mysqld]
+basedir={mysql_home}
+datadir={DATA_DIR}
+socket={TMP_DIR}/mysql.sock
+pid-file={TMP_DIR}/mysql.pid
+port={MYSQL_PORT}
+bind-address=0.0.0.0
+tmpdir={TMP_DIR}
+
+# Performance settings
+max_connections=50
+key_buffer_size=16M
+max_allowed_packet=16M
+thread_stack=192K
+thread_cache_size=8
+
+# Logging
+log_error={TMP_DIR}/mysql_error.log
+
+# Skip some checks for compatibility
+skip-name-resolve
+skip-host-cache
+
+[client]
+socket={TMP_DIR}/mysql.sock
+port={MYSQL_PORT}
+
+[mysql]
+socket={TMP_DIR}/mysql.sock
+"""
+    
+    with open(config_path, 'w') as f:
+        f.write(config_content)
+    
+    print(f"Configuration file created: {config_path}")
+    return config_path
+
+def start_mysql(mysql_home, config_path):
+    """Start MySQL server"""
+    print("Starting MySQL server...")
+    
+    mysqld = mysql_home / "bin" / "mysqld"
+    cmd = [str(mysqld), f"--defaults-file={config_path}"]
+    
+    # Start MySQL in background
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE
+    )
+    
+    print(f"MySQL server started with PID: {process.pid}")
+    
+    # Wait for MySQL to be ready
+    print("Waiting for MySQL to start...")
+    socket_path = TMP_DIR / "mysql.sock"
+    
+    for i in range(30):
+        if socket_path.exists():
+            print("MySQL is ready!")
+            time.sleep(2)  # Give it a bit more time
+            return process
+        time.sleep(1)
+    
+    print("ERROR: MySQL failed to start within 30 seconds")
+    print(f"Check error log: {TMP_DIR}/mysql_error.log")
+    sys.exit(1)
+
+def setup_database(mysql_home):
+    """Create database and user"""
+    print("Creating database and user...")
+    
+    mysql_client = mysql_home / "bin" / "mysql"
+    socket_path = TMP_DIR / "mysql.sock"
+    
+    sql_commands = f"""
+CREATE DATABASE IF NOT EXISTS {DB_NAME};
+CREATE USER IF NOT EXISTS '{DB_USER}'@'%' IDENTIFIED BY '{DB_PASSWORD}';
+GRANT ALL PRIVILEGES ON {DB_NAME}.* TO '{DB_USER}'@'%';
+FLUSH PRIVILEGES;
+SELECT User, Host FROM mysql.user WHERE User='{DB_USER}';
+SHOW DATABASES;
+"""
+    
+    cmd = [
+        str(mysql_client),
+        f"--socket={socket_path}",
+        "-u", "root",
+        "-e", sql_commands
+    ]
+    
+    result = run_command(cmd)
+    print(result.stdout)
+    print("Database and user created successfully!")
+
+def create_helper_scripts(mysql_home):
+    """Create convenience scripts for managing MySQL"""
+    
+    # Start script
+    start_script = HOME / "mysql-start.sh"
+    with open(start_script, 'w') as f:
+        f.write(f"""#!/bin/bash
+MYSQL_HOME="{mysql_home}"
+"$MYSQL_HOME/bin/mysqld" --defaults-file="$HOME/my.cnf" &
+echo "MySQL started. PID: $!"
+""")
+    start_script.chmod(0o755)
+    
+    # Stop script
+    stop_script = HOME / "mysql-stop.sh"
+    with open(stop_script, 'w') as f:
+        f.write(f"""#!/bin/bash
+MYSQL_HOME="{mysql_home}"
+"$MYSQL_HOME/bin/mysqladmin" --socket="{TMP_DIR}/mysql.sock" -u root shutdown
+echo "MySQL stopped."
+""")
+    stop_script.chmod(0o755)
+    
+    # Connect script
+    connect_script = HOME / "mysql-connect.sh"
+    with open(connect_script, 'w') as f:
+        f.write(f"""#!/bin/bash
+MYSQL_HOME="{mysql_home}"
+"$MYSQL_HOME/bin/mysql" --socket="{TMP_DIR}/mysql.sock" -u root
+""")
+    connect_script.chmod(0o755)
+    
+    print("Helper scripts created:")
+    print(f"  Start:   {start_script}")
+    print(f"  Stop:    {stop_script}")
+    print(f"  Connect: {connect_script}")
+
+def print_summary(mysql_process):
+    """Print installation summary"""
+    print_section("Installation Complete!")
+    print("MySQL is now running!")
+    print(f"\nMySQL Process PID: {mysql_process.pid}")
+    print("\nConnection Details:")
+    print(f"  Host:     localhost")
+    print(f"  Port:     {MYSQL_PORT}")
+    print(f"  Socket:   {TMP_DIR}/mysql.sock")
+    print(f"  Database: {DB_NAME}")
+    print(f"  User:     {DB_USER}")
+    print(f"  Password: {DB_PASSWORD}")
+    print("\nConnection String:")
+    print(f"  mysql://{DB_USER}:{DB_PASSWORD}@localhost:{MYSQL_PORT}/{DB_NAME}")
+    print("\nManagement Scripts:")
+    print(f"  Start MySQL: {HOME}/mysql-start.sh")
+    print(f"  Stop MySQL:  {HOME}/mysql-stop.sh")
+    print(f"  Connect:     {HOME}/mysql-connect.sh")
+    print("\n⚠️  WARNING: Change the DB_PASSWORD before using in production!")
+    print()
+
+def main():
+    """Main installation process"""
+    print_section("MySQL Non-Root Installation")
+    
+    # Display system information first
+    try:
+        system_info = get_system_info()
+        print_system_info(system_info)
+    except Exception as e:
+        print(f"⚠️  Could not gather complete system info: {e}")
+        print("   (This won't affect the installation)\n")
+    
+    print(f"Installation directory: {INSTALL_DIR}")
+    print(f"Data directory: {DATA_DIR}")
     
     try:
-        cursor = conn.cursor(dictionary=True)
+        # Download and extract MySQL
+        archive_path = download_mysql()
+        mysql_home = extract_mysql(archive_path)
         
-        if request.method == 'GET':
-            # List all users
-            cursor.execute("SELECT * FROM users ORDER BY created_at DESC")
-            users_list = cursor.fetchall()
-            return jsonify({
-                'users': users_list,
-                'count': len(users_list)
-            })
+        # Initialize and configure
+        initialize_database(mysql_home)
+        config_path = create_config_file(mysql_home)
         
-        elif request.method == 'POST':
-            # Create new user
-            data = request.get_json()
-            name = data.get('name')
-            email = data.get('email')
-            
-            if not name or not email:
-                return jsonify({'error': 'Name and email are required'}), 400
-            
-            cursor.execute(
-                "INSERT INTO users (name, email) VALUES (%s, %s)",
-                (name, email)
-            )
-            conn.commit()
-            
-            return jsonify({
-                'message': 'User created successfully',
-                'user_id': cursor.lastrowid
-            }), 201
-    
-    except mysql.connector.Error as err:
-        return jsonify({'error': str(err)}), 500
-    finally:
-        cursor.close()
-        conn.close()
+        # Start MySQL
+        mysql_process = start_mysql(mysql_home, config_path)
+        
+        # Setup database and user
+        setup_database(mysql_home)
+        
+        # Create helper scripts
+        create_helper_scripts(mysql_home)
+        
+        # Print summary
+        print_summary(mysql_process)
+        
+        print("✅ Installation completed successfully!")
+        
+    except KeyboardInterrupt:
+        print("\n\nInstallation interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Installation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
-@app.route('/users/<int:user_id>')
-def get_user(user_id):
-    """Get specific user by ID"""
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
-    
-    try:
-        cursor = conn.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-        user = cursor.fetchone()
-        
-        if user:
-            return jsonify(user)
-        else:
-            return jsonify({'error': 'User not found'}), 404
-    
-    except mysql.connector.Error as err:
-        return jsonify({'error': str(err)}), 500
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.route('/posts', methods=['GET', 'POST'])
-def posts():
-    """Handle posts - GET to list, POST to create"""
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({'error': 'Database connection failed'}), 500
-    
-    try:
-        cursor = conn.cursor(dictionary=True)
-        
-        if request.method == 'GET':
-            # List all posts with user information
-            cursor.execute("""
-                SELECT p.*, u.name as author_name, u.email as author_email 
-                FROM posts p 
-                JOIN users u ON p.user_id = u.id 
-                ORDER BY p.created_at DESC
-            """)
-            posts_list = cursor.fetchall()
-            return jsonify({
-                'posts': posts_list,
-                'count': len(posts_list)
-            })
-        
-        elif request.method == 'POST':
-            # Create new post
-            data = request.get_json()
-            user_id = data.get('user_id')
-            title = data.get('title')
-            content = data.get('content')
-            
-            if not user_id or not title:
-                return jsonify({'error': 'user_id and title are required'}), 400
-            
-            cursor.execute(
-                "INSERT INTO posts (user_id, title, content) VALUES (%s, %s, %s)",
-                (user_id, title, content)
-            )
-            conn.commit()
-            
-            return jsonify({
-                'message': 'Post created successfully',
-                'post_id': cursor.lastrowid
-            }), 201
-    
-    except mysql.connector.Error as err:
-        return jsonify({'error': str(err)}), 500
-    finally:
-        cursor.close()
-        conn.close()
-
-if __name__ == '__main__':
-    print("\n" + "=" * 60)
-    print("STARTING APPLICATION")
-    print("=" * 60)
-    
-    # Wait a bit for MySQL to be fully ready
-    import time
-    time.sleep(5)
-    
-    # Initialize database tables
-    print("\nInitializing database...")
-    if init_database():
-        print("✓ Database ready\n")
-    else:
-        print("✗ Database initialization failed\n")
-        print("MySQL might still be starting up...")
-    
-    # Get configuration
-    config = get_db_config()
-    print(f"Database: {config.get('database', 'N/A')}")
-    print(f"User: {config.get('user', 'N/A')}")
-    if 'unix_socket' in config:
-        print(f"Connection: Unix Socket ({config['unix_socket']})")
-    else:
-        print(f"Connection: TCP/IP ({config.get('host', 'N/A')}:{config.get('port', 'N/A')})")
-    print("=" * 60 + "\n")
-    
-    # Start Flask app
-    port = int(os.getenv('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+if __name__ == "__main__":
+    main()
